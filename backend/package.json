@@ -1,0 +1,11 @@
+{
+  "name": "ecommerce-backend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "echo \"Choose and install a backend framework first\"",
+    "start": "echo \"No backend server configured yet\"",
+    "test": "echo \"No backend tests configured yet\""
+  }
+}
+

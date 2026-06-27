@@ -1,0 +1,11 @@
+{
+  "name": "ecommerce-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "echo \"Choose and install a frontend framework first\"",
+    "build": "echo \"No frontend build configured yet\"",
+    "test": "echo \"No frontend tests configured yet\""
+  }
+}
+
