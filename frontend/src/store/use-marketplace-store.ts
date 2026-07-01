@@ -12,11 +12,116 @@ import {
   makePaymentCode,
   selectedCheckoutGroups
 } from "@/lib/helpers";
+import { ApiError, apiFetch } from "@/lib/api";
 import type { Address, AppState, OrderStatus, PaymentMethod, PaymentStatus, Product, Role, SellerStatus, User } from "@/types/models";
 
 const STORAGE_KEY = "shepoo-marketplace-state-v1";
+const VERIFICATION_CONTEXT_KEY = "shepoo-verification-context-v1";
+const DEFAULT_AVATAR = "https://images.unsplash.com/photo-1517841905240-472988babdf9?auto=format&fit=crop&w=240&q=80";
+
+type BackendUser = {
+  publicId: string;
+  fullName: string;
+  email: string;
+  phone: string;
+  avatarUrl?: string | null;
+  gender?: User["gender"] | null;
+  dateOfBirth?: string | null;
+  emailVerifiedAt?: string | null;
+  phoneVerifiedAt?: string | null;
+  status: User["status"];
+  lockedUntil?: string | null;
+  lockReason?: string | null;
+  roles: Role[];
+};
+
+type AuthSessionResponse = {
+  user: BackendUser;
+  tokenType: string;
+  expiresIn: number;
+};
+
+type RegistrationStatusResponse = {
+  message: string;
+  registrationId?: string | null;
+  email: string;
+  phone: string;
+  emailVerified: boolean;
+  phoneVerified: boolean;
+  completed: boolean;
+};
+
+type MessageResponse = {
+  message: string;
+};
+
+type VerificationContext = {
+  registrationId?: string | null;
+  email: string;
+  phone: string;
+  emailVerified: boolean;
+  phoneVerified: boolean;
+};
 
 const cloneState = (): AppState => JSON.parse(JSON.stringify(initialState)) as AppState;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PHONE_RE = /^0(3|5|7|8|9)\d{8}$/;
+
+const normalizeAuthEmail = (email: string) => email.trim().toLowerCase();
+
+const normalizeAuthPhone = (phone: string) => {
+  const compact = phone.trim().replace(/[\s.\-()]/g, "");
+  if (compact.startsWith("+84")) return `0${compact.slice(3)}`;
+  if (compact.startsWith("84") && compact.length === 11) return `0${compact.slice(2)}`;
+  return compact;
+};
+
+const authIdentifier = (identifier: string) => {
+  const value = identifier.trim();
+  if (value.includes("@")) return normalizeAuthEmail(value);
+  const phone = normalizeAuthPhone(value);
+  return PHONE_RE.test(phone) ? phone : value;
+};
+
+const validateRegistrationPayload = (
+  payload: Pick<User, "fullName" | "email" | "phone"> & { password: string; confirmPassword: string }
+) => {
+  const fullName = payload.fullName.trim();
+  const email = normalizeAuthEmail(payload.email);
+  const phone = normalizeAuthPhone(payload.phone);
+  const password = payload.password.trim();
+  const confirmPassword = payload.confirmPassword.trim();
+
+  if (fullName.length < 2) return { ok: false as const, message: "Ho ten phai co it nhat 2 ky tu." };
+  if (!EMAIL_RE.test(email)) return { ok: false as const, message: "Email khong hop le." };
+  if (!PHONE_RE.test(phone)) return { ok: false as const, message: "So dien thoai khong hop le." };
+  if (password.length < 8) return { ok: false as const, message: "Mat khau phai co it nhat 8 ky tu." };
+  if (password !== confirmPassword) return { ok: false as const, message: "Mat khau xac nhan khong khop." };
+  return { ok: true as const, fullName, email, phone, password, confirmPassword };
+};
+
+const statusToVerificationContext = (status: RegistrationStatusResponse): VerificationContext => ({
+  registrationId: status.registrationId,
+  email: status.email,
+  phone: status.phone,
+  emailVerified: status.emailVerified,
+  phoneVerified: status.phoneVerified
+});
+
+const readVerificationContext = () => {
+  if (typeof window === "undefined") return undefined;
+  const raw = window.localStorage.getItem(VERIFICATION_CONTEXT_KEY);
+  return raw ? (JSON.parse(raw) as VerificationContext) : undefined;
+};
+
+const persistVerificationContext = (context: VerificationContext | undefined) => {
+  if (typeof window === "undefined") return;
+  if (context) {
+    window.localStorage.setItem(VERIFICATION_CONTEXT_KEY, JSON.stringify(context));
+  } else {
+    window.localStorage.removeItem(VERIFICATION_CONTEXT_KEY);
+  }
+};
 
 const roleHomePath = (role: Role | "GUEST") => {
   if (role === "ADMIN") return "/admin";
@@ -52,16 +157,74 @@ const hydrateSavedState = (saved: AppState): AppState => {
   };
 };
 
+const preferredRoleFor = (user: User) =>
+  user.roles.includes("ADMIN")
+    ? "ADMIN"
+    : user.roles.includes("SUPPORTER")
+      ? "SUPPORTER"
+      : user.roles.includes("SELLER")
+        ? "SELLER"
+        : "CUSTOMER";
+
+const normalizeBackendUser = (user: BackendUser): User => ({
+  id: user.publicId,
+  fullName: user.fullName,
+  email: user.email,
+  phone: user.phone,
+  avatarUrl: user.avatarUrl ?? DEFAULT_AVATAR,
+  gender: user.gender ?? undefined,
+  birthday: user.dateOfBirth ?? undefined,
+  emailVerified: Boolean(user.emailVerifiedAt),
+  phoneVerified: Boolean(user.phoneVerifiedAt),
+  status: user.status,
+  lockedUntil: user.lockedUntil ?? undefined,
+  lockReason: user.lockReason ?? undefined,
+  roles: user.roles
+});
+
+const applyBackendUser = (prev: AppState, backendUser: BackendUser): AppState => {
+  const user = normalizeBackendUser(backendUser);
+  const users = prev.users.some((entry) => entry.id === user.id)
+    ? prev.users.map((entry) => (entry.id === user.id ? { ...entry, ...user } : entry))
+    : [...prev.users, user];
+
+  return {
+    ...prev,
+    users,
+    sessionUserId: user.id,
+    activeRole: preferredRoleFor(user)
+  };
+};
+
 export const useMarketplaceStore = () => {
   const [state, setState] = useState<AppState>(() => cloneState());
+  const [verificationContext, setVerificationContext] = useState<VerificationContext | undefined>();
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
+    let cancelled = false;
     const saved = window.localStorage.getItem(STORAGE_KEY);
     if (saved) {
       setState(hydrateSavedState(JSON.parse(saved) as AppState));
     }
+    setVerificationContext(readVerificationContext());
     setReady(true);
+
+    apiFetch<BackendUser>("/api/v1/auth/me")
+      .then((user) => {
+        if (!cancelled) {
+          setState((prev) => applyBackendUser(prev, user));
+        }
+      })
+      .catch((error) => {
+        if (!cancelled && error instanceof ApiError && ["NOT_AUTHENTICATED", "USER_NOT_VERIFIED"].includes(error.code ?? "")) {
+          setState((prev) => ({ ...prev, sessionUserId: undefined, activeRole: "GUEST" }));
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -85,13 +248,36 @@ export const useMarketplaceStore = () => {
     [state.cartItems, state.products, state.shops, state.variants]
   );
 
-  const login = useCallback((email: string) => {
-    const normalizedEmail = email.trim().toLowerCase();
+  const login = useCallback(async (identifier: string, password: string) => {
+    const normalizedIdentifier = authIdentifier(identifier);
+    try {
+      const result = await apiFetch<AuthSessionResponse>("/api/v1/auth/login", {
+        method: "POST",
+        body: JSON.stringify({
+          identifier: normalizedIdentifier,
+          password,
+          deviceName: window.navigator.userAgent
+        })
+      });
+      const user = normalizeBackendUser(result.user);
+      setState((prev) => applyBackendUser(prev, result.user));
+      const preferredRole = preferredRoleFor(user);
+      return { ok: true, message: `Da dang nhap bang ${user.fullName}.`, redirectTo: roleHomePath(preferredRole) };
+    } catch (error) {
+      if (error instanceof ApiError) {
+        return { ok: false, message: error.message };
+      }
+    }
+
     const hydrated = hydrateSavedState(state);
-    const user = hydrated.users.find((entry) => entry.email.trim().toLowerCase() === normalizedEmail);
+    const user = hydrated.users.find(
+      (entry) =>
+        normalizeAuthEmail(entry.email) === normalizedIdentifier ||
+        normalizeAuthPhone(entry.phone) === normalizedIdentifier
+    );
 
     if (!user) {
-      return { ok: false, message: "Không tìm thấy tài khoản mock." };
+      return { ok: false, message: "Khong tim thay tai khoan." };
     }
 
     if (user.status === "LOCKED") {
@@ -99,6 +285,10 @@ export const useMarketplaceStore = () => {
         ok: false,
         message: `Tài khoản bị khóa. Lý do: ${user.lockReason ?? "Không rõ"}.`
       };
+    }
+
+    if (!user.emailVerified || !user.phoneVerified) {
+      return { ok: false, message: "Tai khoan chua xac thuc email va so dien thoai." };
     }
 
     const preferredRole = user.roles.includes("ADMIN")
@@ -113,25 +303,152 @@ export const useMarketplaceStore = () => {
     return { ok: true, message: `Đã đăng nhập bằng ${user.fullName}.`, redirectTo: roleHomePath(preferredRole) };
   }, [state]);
 
-  const register = useCallback((payload: Pick<User, "fullName" | "email" | "phone">) => {
-    setState((prev) => {
-      const user: User = {
-        id: `u-new-${prev.users.length + 1}`,
-        fullName: payload.fullName,
-        email: payload.email,
-        phone: payload.phone,
-        avatarUrl: "https://images.unsplash.com/photo-1517841905240-472988babdf9?auto=format&fit=crop&w=240&q=80",
-        emailVerified: false,
-        phoneVerified: false,
-        status: "ACTIVE",
-        roles: ["CUSTOMER"]
+  const register = useCallback(async (
+    payload: Pick<User, "fullName" | "email" | "phone"> & { password: string; confirmPassword: string }
+  ) => {
+    const validation = validateRegistrationPayload(payload);
+    if (!validation.ok) {
+      return { ok: false, message: validation.message };
+    }
+
+    try {
+      const result = await apiFetch<RegistrationStatusResponse>("/api/v1/auth/register", {
+        method: "POST",
+        body: JSON.stringify({
+          fullName: validation.fullName,
+          email: validation.email,
+          phone: validation.phone,
+          password: validation.password,
+          confirmPassword: validation.confirmPassword
+        })
+      });
+      const context = statusToVerificationContext(result);
+      persistVerificationContext(context);
+      setVerificationContext(context);
+      setState((prev) => ({ ...prev, sessionUserId: undefined, activeRole: "GUEST" }));
+      return {
+        ok: true,
+        message: result.message,
+        redirectTo: result.emailVerified ? (result.phoneVerified ? "/login" : "/verify-phone") : "/verify-email"
       };
-      return { ...prev, users: [...prev.users, user], sessionUserId: user.id, activeRole: "CUSTOMER" };
-    });
+    } catch (error) {
+      if (error instanceof ApiError) {
+        return { ok: false, message: error.message };
+      }
+      return { ok: false, message: "Khong the dang ky luc nay." };
+    }
   }, []);
 
-  const logout = useCallback(() => {
-    setState((prev) => ({ ...prev, sessionUserId: undefined, activeRole: "GUEST" }));
+  const verifyEmail = useCallback(async (token: string) => {
+    if (!token.trim()) return { ok: false, message: "Vui long nhap ma xac thuc email." };
+
+    try {
+      const result = await apiFetch<RegistrationStatusResponse>("/api/v1/auth/verify-email", {
+        method: "POST",
+        body: JSON.stringify({ token: token.trim() })
+      });
+      if (result.completed) {
+        persistVerificationContext(undefined);
+        setVerificationContext(undefined);
+        setState((prev) => ({ ...prev, sessionUserId: undefined, activeRole: "GUEST" }));
+      } else {
+        const context = statusToVerificationContext(result);
+        persistVerificationContext(context);
+        setVerificationContext(context);
+      }
+      return {
+        ok: true,
+        message: result.message,
+        redirectTo: result.completed ? "/login" : result.phoneVerified ? "/verify-email" : "/verify-phone"
+      };
+    } catch (error) {
+      if (error instanceof ApiError) {
+        return { ok: false, message: error.message };
+      }
+      return { ok: false, message: "Khong the xac thuc email luc nay." };
+    }
+  }, []);
+
+  const verifyPhone = useCallback(async (phone: string, otp: string) => {
+    const normalizedPhone = normalizeAuthPhone(phone);
+    if (!PHONE_RE.test(normalizedPhone)) return { ok: false, message: "So dien thoai khong hop le." };
+    if (!/^\d{6}$/.test(otp.trim())) return { ok: false, message: "OTP phai gom 6 chu so." };
+
+    try {
+      const result = await apiFetch<RegistrationStatusResponse>("/api/v1/auth/verify-phone", {
+        method: "POST",
+        body: JSON.stringify({
+          registrationId: verificationContext?.registrationId,
+          phone: normalizedPhone,
+          otp: otp.trim()
+        })
+      });
+      if (result.completed) {
+        persistVerificationContext(undefined);
+        setVerificationContext(undefined);
+        setState((prev) => ({ ...prev, sessionUserId: undefined, activeRole: "GUEST" }));
+      } else {
+        const context = statusToVerificationContext(result);
+        persistVerificationContext(context);
+        setVerificationContext(context);
+      }
+      return {
+        ok: true,
+        message: result.message,
+        redirectTo: result.completed ? "/login" : result.emailVerified ? "/verify-phone" : "/verify-email"
+      };
+    } catch (error) {
+      if (error instanceof ApiError) {
+        return { ok: false, message: error.message };
+      }
+      return { ok: false, message: "Khong the xac thuc so dien thoai luc nay." };
+    }
+  }, [verificationContext?.registrationId]);
+
+  const resendEmailVerification = useCallback(async () => {
+    try {
+      const result = await apiFetch<MessageResponse>("/api/v1/auth/verify-email/resend", {
+        method: "POST",
+        body: JSON.stringify({
+          registrationId: verificationContext?.registrationId,
+          email: verificationContext?.email
+        })
+      });
+      return { ok: true, message: result.message };
+    } catch (error) {
+      if (error instanceof ApiError) {
+        return { ok: false, message: error.message };
+      }
+      return { ok: false, message: "Khong the gui lai ma xac thuc email luc nay." };
+    }
+  }, [verificationContext?.email, verificationContext?.registrationId]);
+
+  const resendPhoneVerification = useCallback(async () => {
+    try {
+      const result = await apiFetch<MessageResponse>("/api/v1/auth/verify-phone/resend", {
+        method: "POST",
+        body: JSON.stringify({
+          registrationId: verificationContext?.registrationId,
+          phone: verificationContext?.phone
+        })
+      });
+      return { ok: true, message: result.message };
+    } catch (error) {
+      if (error instanceof ApiError) {
+        return { ok: false, message: error.message };
+      }
+      return { ok: false, message: "Khong the gui lai OTP luc nay." };
+    }
+  }, [verificationContext?.phone, verificationContext?.registrationId]);
+
+  const logout = useCallback(async () => {
+    try {
+      await apiFetch<{ message: string }>("/api/v1/auth/logout", { method: "POST" });
+    } catch {
+      // Keep logout local even if the backend is offline.
+    } finally {
+      setState((prev) => ({ ...prev, sessionUserId: undefined, activeRole: "GUEST" }));
+    }
   }, []);
 
   const switchRole = useCallback((role: Role | "GUEST") => {
@@ -392,9 +709,14 @@ export const useMarketplaceStore = () => {
     ready,
     currentUser,
     currentShop,
+    verificationContext,
     cartRows,
     login,
     register,
+    verifyEmail,
+    verifyPhone,
+    resendEmailVerification,
+    resendPhoneVerification,
     logout,
     switchRole,
     addToCart,

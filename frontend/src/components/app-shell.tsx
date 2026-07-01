@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
-import { usePathname } from "next/navigation";
+import { usePathname, useSearchParams } from "next/navigation";
 import {
   Bell,
   Bot,
@@ -91,6 +91,15 @@ type ToastTone = "success" | "danger" | "info";
 type ToastState = { message: string; tone: ToastTone } | undefined;
 
 const brandName = "Shepoo";
+const authEmailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const authPhonePattern = /^0(3|5|7|8|9)\d{8}$/;
+const normalizeAuthPhoneInput = (value: string) => {
+  const compact = value.trim().replace(/[\s.\-()]/g, "");
+  if (compact.startsWith("+84")) return `0${compact.slice(3)}`;
+  if (compact.startsWith("84") && compact.length === 11) return `0${compact.slice(2)}`;
+  return compact;
+};
+type AuthFormErrors = Partial<Record<"fullName" | "email" | "phone" | "password" | "confirmPassword", string>>;
 
 const linkClass =
   "inline-flex min-h-10 items-center gap-2 rounded-panel px-3 py-2 text-sm font-semibold text-muted transition hover:bg-white hover:text-primary";
@@ -131,6 +140,7 @@ function RedirectTo({ href }: { href: string }) {
 
 export function AppShell() {
   const pathname = usePathname() || "/";
+  const searchParams = useSearchParams();
   const segments = pathname.split("/").filter(Boolean);
   const store = useMarketplaceStore();
   const [toast, setToast] = useState<ToastState>();
@@ -817,57 +827,135 @@ export function AppShell() {
   }
 
   function AuthPage({ mode }: { mode: "login" | "register" }) {
-    const [email, setEmail] = useState(mode === "login" ? "customer@demo.vn" : "");
+    const [email, setEmail] = useState("");
     const [fullName, setFullName] = useState("");
     const [phone, setPhone] = useState("");
+    const [password, setPassword] = useState("");
+    const [confirmPassword, setConfirmPassword] = useState("");
+    const [formErrors, setFormErrors] = useState<AuthFormErrors>({});
+    const [submitting, setSubmitting] = useState(false);
+
+    const validateAuthForm = () => {
+      const nextErrors: AuthFormErrors = {};
+      const normalizedEmail = email.trim().toLowerCase();
+      const normalizedPhone = normalizeAuthPhoneInput(phone);
+      const normalizedLoginPhone = normalizeAuthPhoneInput(email);
+      const isLoginIdentifierValid =
+        authEmailPattern.test(normalizedEmail) || authPhonePattern.test(normalizedLoginPhone);
+
+      if (mode === "register" && fullName.trim().length < 2) {
+        nextErrors.fullName = "Họ tên phải có ít nhất 2 ký tự.";
+      }
+      if (mode === "login" ? !isLoginIdentifierValid : !authEmailPattern.test(normalizedEmail)) {
+        nextErrors.email = mode === "login" ? "Nhập email hoặc số điện thoại hợp lệ." : "Email không hợp lệ.";
+      }
+      if (mode === "register" && !authPhonePattern.test(normalizedPhone)) {
+        nextErrors.phone = "Số điện thoại không hợp lệ.";
+      }
+      if (password.length < (mode === "register" ? 8 : 1)) {
+        nextErrors.password = mode === "register" ? "Mật khẩu phải có ít nhất 8 ký tự." : "Vui lòng nhập mật khẩu.";
+      }
+
+      if (mode === "register" && password !== confirmPassword) {
+        nextErrors.confirmPassword = "Mật khẩu xác nhận không khớp.";
+      }
+
+      setFormErrors(nextErrors);
+      return Object.keys(nextErrors).length === 0;
+    };
+
     return (
       <main className="mx-auto grid min-h-[70vh] max-w-5xl items-center gap-5 px-4 py-8 lg:grid-cols-[1fr_420px]">
         <div>
-          <StatusBadge status="ACTIVE" label="Mock auth/session" />
+          <StatusBadge status="ACTIVE" label="Backend auth/cookie" />
           <h1 className="mt-4 text-4xl font-black text-ink">{mode === "login" ? "Đăng nhập Shepoo" : "Tạo tài khoản khách hàng"}</h1>
           <p className="mt-3 text-sm leading-6 text-muted">
             Admin và supporter vào dashboard riêng sau đăng nhập. Seller chỉ có quyền sau khi shop được admin duyệt.
           </p>
-          <div className="mt-5 grid gap-2 sm:grid-cols-2">
-            {["customer@demo.vn", "seller@demo.vn", "admin@demo.vn", "supporter@demo.vn", "locked@demo.vn"].map((demo) => (
-              <Button key={demo} variant="secondary" onClick={() => setEmail(demo)}>
-                {demo}
-              </Button>
-            ))}
-          </div>
         </div>
         <Panel>
           <div className="grid gap-4">
             {mode === "register" ? (
               <>
-                <Field label="Họ tên">
-                  <Input value={fullName} onChange={(event) => setFullName(event.target.value)} placeholder="Nguyễn Văn A" />
+                <Field label="Họ tên" hint={formErrors.fullName ? <span className="text-coral">{formErrors.fullName}</span> : null}>
+                  <Input
+                    value={fullName}
+                    onChange={(event) => setFullName(event.target.value)}
+                    placeholder="Nguyễn Văn A"
+                    autoComplete="name"
+                    className={formErrors.fullName ? "border-coral" : undefined}
+                  />
                 </Field>
-                <Field label="Số điện thoại">
-                  <Input value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="090..." />
+                <Field label="Số điện thoại" hint={formErrors.phone ? <span className="text-coral">{formErrors.phone}</span> : null}>
+                  <Input
+                    value={phone}
+                    onChange={(event) => setPhone(event.target.value)}
+                    placeholder="0901234567"
+                    autoComplete="tel"
+                    inputMode="tel"
+                    className={formErrors.phone ? "border-coral" : undefined}
+                  />
                 </Field>
               </>
             ) : null}
-            <Field label="Email">
-              <Input value={email} onChange={(event) => setEmail(event.target.value)} placeholder="customer@demo.vn" />
+            <Field
+              label={mode === "login" ? "Email hoặc số điện thoại" : "Email"}
+              hint={formErrors.email ? <span className="text-coral">{formErrors.email}</span> : null}
+            >
+              <Input
+                type={mode === "login" ? "text" : "email"}
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+                placeholder={mode === "login" ? "email@example.com hoặc 0901234567" : "email@example.com"}
+                autoComplete={mode === "login" ? "username" : "email"}
+                inputMode={mode === "login" ? "text" : "email"}
+                className={formErrors.email ? "border-coral" : undefined}
+              />
             </Field>
-            <Field label="Mật khẩu">
-              <Input type="password" placeholder="Mock không kiểm tra mật khẩu" />
+            <Field label="Mật khẩu" hint={formErrors.password ? <span className="text-coral">{formErrors.password}</span> : null}>
+              <Input
+                type="password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                placeholder={mode === "login" ? "Mật khẩu" : "Tối thiểu 8 ký tự"}
+                autoComplete={mode === "login" ? "current-password" : "new-password"}
+                className={formErrors.password ? "border-coral" : undefined}
+              />
             </Field>
+            {mode === "register" ? (
+              <Field label="Nhập lại mật khẩu" hint={formErrors.confirmPassword ? <span className="text-coral">{formErrors.confirmPassword}</span> : null}>
+                <Input
+                  type="password"
+                  value={confirmPassword}
+                  onChange={(event) => setConfirmPassword(event.target.value)}
+                  placeholder="Nhập lại mật khẩu"
+                  autoComplete="new-password"
+                  className={formErrors.confirmPassword ? "border-coral" : undefined}
+                />
+              </Field>
+            ) : null}
             <Button
-              onClick={() => {
-                if (mode === "login") {
-                  const result = store.login(email);
-                  showToast(result.message, result.ok ? "success" : "danger");
-                  if (result.ok) window.location.href = result.redirectTo ?? "/";
-                } else {
-                  store.register({ fullName: fullName || "Khách hàng mới", email, phone: phone || "0900000000" });
-                  showToast("Đã đăng ký tài khoản mock.", "success");
-                  window.location.href = "/verify-email";
-                }
+              disabled={submitting}
+              onClick={async () => {
+                if (!validateAuthForm()) return;
+                setSubmitting(true);
+                const normalizedPhone = normalizeAuthPhoneInput(phone);
+                const result =
+                  mode === "login"
+                    ? await store.login(email, password)
+                    : await store.register({
+                        fullName: fullName.trim(),
+                        email: email.trim().toLowerCase(),
+                        phone: normalizedPhone,
+                        password,
+                        confirmPassword
+                      });
+                setSubmitting(false);
+                showToast(result.message, result.ok ? "success" : "danger");
+                if (result.ok) window.location.href = result.redirectTo ?? "/";
               }}
             >
-              {mode === "login" ? "Đăng nhập" : "Đăng ký"}
+              {submitting ? "Đang xử lý" : mode === "login" ? "Đăng nhập" : "Đăng ký"}
             </Button>
             <div className="flex flex-wrap gap-2 text-sm text-muted">
               <a href="/forgot-password" className="font-semibold text-primary">Quên mật khẩu</a>
@@ -882,19 +970,90 @@ export function AppShell() {
   }
 
   function VerificationPage({ type }: { type: "email" | "phone" }) {
+    const [code, setCode] = useState(type === "email" ? searchParams?.get("token") ?? "" : "");
+    const [phone, setPhone] = useState(store.verificationContext?.phone ?? store.currentUser?.phone ?? "");
+    const [submitting, setSubmitting] = useState(false);
+    const [fieldError, setFieldError] = useState("");
+
+    useEffect(() => {
+      if (type === "phone" && !phone && store.verificationContext?.phone) {
+        setPhone(store.verificationContext.phone);
+      }
+    }, [phone, type, store.verificationContext?.phone]);
+
+    const submitVerification = async () => {
+      setFieldError("");
+      const normalizedPhone = normalizeAuthPhoneInput(phone || store.verificationContext?.phone || store.currentUser?.phone || "");
+      if (type === "phone" && !authPhonePattern.test(normalizedPhone)) {
+        setFieldError("Số điện thoại không hợp lệ.");
+        return;
+      }
+      if (type === "phone" && !/^\d{6}$/.test(code.trim())) {
+        setFieldError("OTP phải gồm 6 chữ số.");
+        return;
+      }
+      if (type === "email" && !code.trim()) {
+        setFieldError("Vui lòng nhập mã xác thực email.");
+        return;
+      }
+
+      setSubmitting(true);
+      const result =
+        type === "email"
+          ? await store.verifyEmail(code)
+          : await store.verifyPhone(normalizedPhone, code);
+      setSubmitting(false);
+      showToast(result.message, result.ok ? "success" : "danger");
+      if (result.ok) window.location.href = result.redirectTo ?? "/";
+    };
+
+    const resendVerification = async () => {
+      const result =
+        type === "email"
+          ? await store.resendEmailVerification()
+          : await store.resendPhoneVerification();
+      showToast(result.message, result.ok ? "success" : "danger");
+    };
+
     return (
       <main className="mx-auto max-w-xl px-4 py-10">
         <Panel>
           <ShieldCheck className="h-10 w-10 text-primary" aria-hidden="true" />
           <h1 className="mt-3 text-2xl font-black text-ink">{type === "email" ? "Xác thực email" : "Xác thực số điện thoại"}</h1>
           <p className="mt-2 text-sm leading-6 text-muted">
-            Màn hình đầy đủ cho luồng token/OTP. Backend sau này nối API gửi mã và xác minh tại đây.
+            {type === "email" ? store.verificationContext?.email ?? store.currentUser?.email : store.verificationContext?.phone ?? store.currentUser?.phone}
           </p>
           <div className="mt-4 grid gap-3">
+            {type === "phone" ? (
+              <Field label="Số điện thoại">
+                <Input
+                  value={phone}
+                  onChange={(event) => setPhone(event.target.value)}
+                  placeholder="0901234567"
+                  inputMode="tel"
+                  autoComplete="tel"
+                />
+              </Field>
+            ) : null}
             <Field label={type === "email" ? "Mã xác thực email" : "OTP điện thoại"}>
-              <Input placeholder={type === "email" ? "Nhập token email" : "Nhập 6 chữ số"} />
+              <Input
+                value={code}
+                onChange={(event) => setCode(event.target.value)}
+                placeholder={type === "email" ? "Nhập mã xác thực" : "Nhập 6 chữ số"}
+                inputMode={type === "phone" ? "numeric" : "text"}
+                autoComplete="one-time-code"
+                className={fieldError ? "border-coral" : undefined}
+              />
             </Field>
-            <Button onClick={() => showToast("Xác thực mock thành công.", "success")}>Xác thực</Button>
+            {fieldError ? <p className="text-xs font-semibold text-coral">{fieldError}</p> : null}
+            <div className="flex flex-wrap gap-2">
+              <Button disabled={submitting} onClick={submitVerification}>
+                {submitting ? "Đang xác thực" : "Xác thực"}
+              </Button>
+              <Button type="button" variant="secondary" onClick={resendVerification}>
+                Gửi lại mã
+              </Button>
+            </div>
           </div>
         </Panel>
       </main>
@@ -1598,8 +1757,8 @@ export function AppShell() {
               ) : null}
               <IconButton
                 aria-label="Đăng xuất"
-                onClick={() => {
-                  store.logout();
+                onClick={async () => {
+                  await store.logout();
                   window.location.href = "/login";
                 }}
               >
