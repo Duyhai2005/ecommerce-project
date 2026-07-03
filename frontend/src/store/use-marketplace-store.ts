@@ -12,33 +12,54 @@ import {
   makePaymentCode,
   selectedCheckoutGroups
 } from "@/lib/helpers";
-import { ApiError, apiFetch } from "@/lib/api";
+import { AUTH_BASE_PATH, ApiError, apiFetch } from "@/lib/api";
 import type { Address, AppState, OrderStatus, PaymentMethod, PaymentStatus, Product, Role, SellerStatus, User } from "@/types/models";
 
-const STORAGE_KEY = "shepoo-marketplace-state-v1";
-const VERIFICATION_CONTEXT_KEY = "shepoo-verification-context-v1";
+const STORAGE_KEY = "shepoo-marketplace-state-v2";
+const VERIFICATION_CONTEXT_KEY = "shepoo-verification-context-v2";
+const LEGACY_STORAGE_KEYS = ["shepoo-marketplace-state-v1", "shepoo-verification-context-v1"];
 const DEFAULT_AVATAR = "https://images.unsplash.com/photo-1517841905240-472988babdf9?auto=format&fit=crop&w=240&q=80";
+const AUTH_ROUTES = {
+  me: `${AUTH_BASE_PATH}/me`,
+  login: `${AUTH_BASE_PATH}/login`,
+  register: `${AUTH_BASE_PATH}/register`,
+  verifyEmail: `${AUTH_BASE_PATH}/verify-email`,
+  resendEmail: `${AUTH_BASE_PATH}/verify-email/send`,
+  verifyPhone: `${AUTH_BASE_PATH}/verify-phone`,
+  resendPhone: `${AUTH_BASE_PATH}/verify-phone/send`,
+  logout: `${AUTH_BASE_PATH}/logout`
+};
 
 type BackendUser = {
-  publicId: string;
-  fullName: string;
+  publicId?: string;
+  public_id?: string;
+  fullName?: string;
+  full_name?: string;
+  fullname?: string;
   email: string;
   phone: string;
   avatarUrl?: string | null;
+  avatar_url?: string | null;
   gender?: User["gender"] | null;
   dateOfBirth?: string | null;
+  date_of_birth?: string | null;
   emailVerifiedAt?: string | null;
+  email_verified_at?: string | null;
   phoneVerifiedAt?: string | null;
-  status: User["status"];
+  phone_verified_at?: string | null;
+  status?: User["status"];
   lockedUntil?: string | null;
+  locked_until?: string | null;
   lockReason?: string | null;
-  roles: Role[];
+  lock_reason?: string | null;
+  roles?: Role[];
 };
 
-type AuthSessionResponse = {
-  user: BackendUser;
-  tokenType: string;
-  expiresIn: number;
+type BackendRegisterResponse = {
+  fullname: string;
+  username: string;
+  email: string;
+  phone: string;
 };
 
 type RegistrationStatusResponse = {
@@ -53,6 +74,11 @@ type RegistrationStatusResponse = {
 
 type MessageResponse = {
   message: string;
+};
+
+type BackendStatusResponse = {
+  completed: boolean;
+  message?: string;
 };
 
 type VerificationContext = {
@@ -99,6 +125,23 @@ const validateRegistrationPayload = (
   if (password !== confirmPassword) return { ok: false as const, message: "Mat khau xac nhan khong khop." };
   return { ok: true as const, fullName, email, phone, password, confirmPassword };
 };
+
+const usernameFromRegistration = (email: string, phone: string) => {
+  const localPart = email.split("@")[0]?.toLowerCase() ?? "";
+  const cleaned = localPart.replace(/[^a-z0-9_]/g, "").slice(0, 32);
+  if (cleaned.length >= 2) return cleaned;
+  return `user${phone.slice(-6)}`.slice(0, 40);
+};
+
+const backendRegisterToStatus = (result: BackendRegisterResponse): RegistrationStatusResponse => ({
+  message: "Dang ky thanh cong. Vui long xac thuc email neu backend da gui ma.",
+  registrationId: result.username,
+  email: result.email,
+  phone: result.phone,
+  emailVerified: false,
+  phoneVerified: false,
+  completed: false
+});
 
 const statusToVerificationContext = (status: RegistrationStatusResponse): VerificationContext => ({
   registrationId: status.registrationId,
@@ -167,19 +210,19 @@ const preferredRoleFor = (user: User) =>
         : "CUSTOMER";
 
 const normalizeBackendUser = (user: BackendUser): User => ({
-  id: user.publicId,
-  fullName: user.fullName,
+  id: user.publicId ?? user.public_id ?? user.email,
+  fullName: user.fullName ?? user.full_name ?? user.fullname ?? user.email,
   email: user.email,
   phone: user.phone,
-  avatarUrl: user.avatarUrl ?? DEFAULT_AVATAR,
+  avatarUrl: user.avatarUrl ?? user.avatar_url ?? DEFAULT_AVATAR,
   gender: user.gender ?? undefined,
-  birthday: user.dateOfBirth ?? undefined,
-  emailVerified: Boolean(user.emailVerifiedAt),
-  phoneVerified: Boolean(user.phoneVerifiedAt),
-  status: user.status,
-  lockedUntil: user.lockedUntil ?? undefined,
-  lockReason: user.lockReason ?? undefined,
-  roles: user.roles
+  birthday: user.dateOfBirth ?? user.date_of_birth ?? undefined,
+  emailVerified: Boolean(user.emailVerifiedAt ?? user.email_verified_at),
+  phoneVerified: Boolean(user.phoneVerifiedAt ?? user.phone_verified_at),
+  status: user.status ?? "ACTIVE",
+  lockedUntil: user.lockedUntil ?? user.locked_until ?? undefined,
+  lockReason: user.lockReason ?? user.lock_reason ?? undefined,
+  roles: user.roles ?? ["CUSTOMER"]
 });
 
 const applyBackendUser = (prev: AppState, backendUser: BackendUser): AppState => {
@@ -203,6 +246,7 @@ export const useMarketplaceStore = () => {
 
   useEffect(() => {
     let cancelled = false;
+    LEGACY_STORAGE_KEYS.forEach((key) => window.localStorage.removeItem(key));
     const saved = window.localStorage.getItem(STORAGE_KEY);
     if (saved) {
       setState(hydrateSavedState(JSON.parse(saved) as AppState));
@@ -210,7 +254,7 @@ export const useMarketplaceStore = () => {
     setVerificationContext(readVerificationContext());
     setReady(true);
 
-    apiFetch<BackendUser>("/api/v1/auth/me")
+    apiFetch<BackendUser>(AUTH_ROUTES.me)
       .then((user) => {
         if (!cancelled) {
           setState((prev) => applyBackendUser(prev, user));
@@ -251,18 +295,26 @@ export const useMarketplaceStore = () => {
   const login = useCallback(async (identifier: string, password: string) => {
     const normalizedIdentifier = authIdentifier(identifier);
     try {
-      const result = await apiFetch<AuthSessionResponse>("/api/v1/auth/login", {
+      const loginResult = await apiFetch<MessageResponse | BackendStatusResponse>(AUTH_ROUTES.login, {
         method: "POST",
         body: JSON.stringify({
           identifier: normalizedIdentifier,
-          password,
-          deviceName: window.navigator.userAgent
+          password
         })
       });
-      const user = normalizeBackendUser(result.user);
-      setState((prev) => applyBackendUser(prev, result.user));
+      const backendUser = await apiFetch<BackendUser>(AUTH_ROUTES.me);
+      const user = normalizeBackendUser(backendUser);
+      setState((prev) => applyBackendUser(prev, backendUser));
       const preferredRole = preferredRoleFor(user);
-      return { ok: true, message: `Da dang nhap bang ${user.fullName}.`, redirectTo: roleHomePath(preferredRole) };
+      const message =
+        "message" in loginResult && loginResult.message
+          ? loginResult.message
+          : `Da dang nhap bang ${user.fullName}.`;
+      return {
+        ok: true,
+        message,
+        redirectTo: roleHomePath(preferredRole)
+      };
     } catch (error) {
       if (error instanceof ApiError) {
         return { ok: false, message: error.message };
@@ -312,30 +364,50 @@ export const useMarketplaceStore = () => {
     }
 
     try {
-      const result = await apiFetch<RegistrationStatusResponse>("/api/v1/auth/register", {
+      const result = await apiFetch<BackendRegisterResponse>(AUTH_ROUTES.register, {
         method: "POST",
         body: JSON.stringify({
-          fullName: validation.fullName,
+          fullname: validation.fullName,
+          username: usernameFromRegistration(validation.email, validation.phone),
           email: validation.email,
           phone: validation.phone,
           password: validation.password,
-          confirmPassword: validation.confirmPassword
+          confirm_password: validation.confirmPassword
         })
       });
-      const context = statusToVerificationContext(result);
+      const registrationStatus = backendRegisterToStatus(result);
+      const context = statusToVerificationContext(registrationStatus);
       persistVerificationContext(context);
       setVerificationContext(context);
       setState((prev) => ({ ...prev, sessionUserId: undefined, activeRole: "GUEST" }));
+
+      let message = registrationStatus.message;
+      try {
+        const query = new URLSearchParams({ phone: validation.phone });
+        const otpResult = await apiFetch<MessageResponse>(`${AUTH_ROUTES.resendPhone}?${query.toString()}`, {
+          method: "POST"
+        });
+        message = otpResult.message;
+      } catch (error) {
+        message =
+          error instanceof ApiError
+            ? `Dang ky thanh cong, nhung chua gui duoc OTP: ${error.message}`
+            : "Dang ky thanh cong, nhung chua gui duoc OTP. Hay bam Gui lai ma.";
+      }
+
       return {
         ok: true,
-        message: result.message,
-        redirectTo: result.emailVerified ? (result.phoneVerified ? "/login" : "/verify-phone") : "/verify-email"
+        message,
+        redirectTo: "/verify-phone"
       };
     } catch (error) {
       if (error instanceof ApiError) {
         return { ok: false, message: error.message };
       }
-      return { ok: false, message: "Khong the dang ky luc nay." };
+      return {
+        ok: false,
+        message: "Khong ket noi duoc backend dang ky. Hay chay backend o http://127.0.0.1:8000 roi thu lai."
+      };
     }
   }, []);
 
@@ -343,23 +415,32 @@ export const useMarketplaceStore = () => {
     if (!token.trim()) return { ok: false, message: "Vui long nhap ma xac thuc email." };
 
     try {
-      const result = await apiFetch<RegistrationStatusResponse>("/api/v1/auth/verify-email", {
-        method: "POST",
-        body: JSON.stringify({ token: token.trim() })
+      const query = new URLSearchParams({ token: token.trim() });
+      const result = await apiFetch<BackendStatusResponse>(`${AUTH_ROUTES.verifyEmail}?${query.toString()}`, {
+        method: "POST"
       });
-      if (result.completed) {
+      const status: RegistrationStatusResponse = {
+        message: result.message ?? "Xac thuc email thanh cong.",
+        registrationId: verificationContext?.registrationId,
+        email: verificationContext?.email ?? "",
+        phone: verificationContext?.phone ?? "",
+        emailVerified: result.completed,
+        phoneVerified: verificationContext?.phoneVerified ?? false,
+        completed: result.completed
+      };
+      if (status.completed) {
         persistVerificationContext(undefined);
         setVerificationContext(undefined);
         setState((prev) => ({ ...prev, sessionUserId: undefined, activeRole: "GUEST" }));
       } else {
-        const context = statusToVerificationContext(result);
+        const context = statusToVerificationContext(status);
         persistVerificationContext(context);
         setVerificationContext(context);
       }
       return {
         ok: true,
-        message: result.message,
-        redirectTo: result.completed ? "/login" : result.phoneVerified ? "/verify-email" : "/verify-phone"
+        message: status.message,
+        redirectTo: status.completed ? "/login" : status.phoneVerified ? "/verify-email" : "/verify-phone"
       };
     } catch (error) {
       if (error instanceof ApiError) {
@@ -375,27 +456,32 @@ export const useMarketplaceStore = () => {
     if (!/^\d{6}$/.test(otp.trim())) return { ok: false, message: "OTP phai gom 6 chu so." };
 
     try {
-      const result = await apiFetch<RegistrationStatusResponse>("/api/v1/auth/verify-phone", {
-        method: "POST",
-        body: JSON.stringify({
-          registrationId: verificationContext?.registrationId,
-          phone: normalizedPhone,
-          otp: otp.trim()
-        })
+      const query = new URLSearchParams({ phone: normalizedPhone, otp: otp.trim() });
+      const result = await apiFetch<BackendStatusResponse>(`${AUTH_ROUTES.verifyPhone}?${query.toString()}`, {
+        method: "POST"
       });
-      if (result.completed) {
+      const status: RegistrationStatusResponse = {
+        message: result.message ?? "Xac thuc so dien thoai thanh cong.",
+        registrationId: verificationContext?.registrationId,
+        email: verificationContext?.email ?? currentUser?.email ?? "",
+        phone: normalizedPhone,
+        emailVerified: verificationContext?.emailVerified ?? currentUser?.emailVerified ?? false,
+        phoneVerified: result.completed,
+        completed: Boolean((verificationContext?.emailVerified ?? currentUser?.emailVerified) && result.completed)
+      };
+      if (status.completed) {
         persistVerificationContext(undefined);
         setVerificationContext(undefined);
         setState((prev) => ({ ...prev, sessionUserId: undefined, activeRole: "GUEST" }));
       } else {
-        const context = statusToVerificationContext(result);
+        const context = statusToVerificationContext(status);
         persistVerificationContext(context);
         setVerificationContext(context);
       }
       return {
         ok: true,
-        message: result.message,
-        redirectTo: result.completed ? "/login" : result.emailVerified ? "/verify-phone" : "/verify-email"
+        message: status.message,
+        redirectTo: status.completed ? "/login" : status.emailVerified ? "/verify-phone" : "/verify-email"
       };
     } catch (error) {
       if (error instanceof ApiError) {
@@ -403,16 +489,16 @@ export const useMarketplaceStore = () => {
       }
       return { ok: false, message: "Khong the xac thuc so dien thoai luc nay." };
     }
-  }, [verificationContext?.registrationId]);
+  }, [currentUser?.email, currentUser?.emailVerified, verificationContext?.email, verificationContext?.emailVerified, verificationContext?.registrationId]);
 
   const resendEmailVerification = useCallback(async () => {
     try {
-      const result = await apiFetch<MessageResponse>("/api/v1/auth/verify-email/resend", {
-        method: "POST",
-        body: JSON.stringify({
-          registrationId: verificationContext?.registrationId,
-          email: verificationContext?.email
-        })
+      const query = new URLSearchParams({
+        email: verificationContext?.email ?? "",
+        full_name: currentUser?.fullName ?? verificationContext?.email?.split("@")[0] ?? ""
+      });
+      const result = await apiFetch<MessageResponse>(`${AUTH_ROUTES.resendEmail}?${query.toString()}`, {
+        method: "POST"
       });
       return { ok: true, message: result.message };
     } catch (error) {
@@ -421,17 +507,26 @@ export const useMarketplaceStore = () => {
       }
       return { ok: false, message: "Khong the gui lai ma xac thuc email luc nay." };
     }
-  }, [verificationContext?.email, verificationContext?.registrationId]);
+  }, [currentUser?.fullName, verificationContext?.email]);
 
-  const resendPhoneVerification = useCallback(async () => {
+  const resendPhoneVerification = useCallback(async (phoneOverride?: string) => {
+    const normalizedPhone = normalizeAuthPhone(phoneOverride ?? verificationContext?.phone ?? currentUser?.phone ?? "");
+    if (!PHONE_RE.test(normalizedPhone)) return { ok: false, message: "So dien thoai khong hop le." };
+
     try {
-      const result = await apiFetch<MessageResponse>("/api/v1/auth/verify-phone/resend", {
-        method: "POST",
-        body: JSON.stringify({
-          registrationId: verificationContext?.registrationId,
-          phone: verificationContext?.phone
-        })
+      const query = new URLSearchParams({ phone: normalizedPhone });
+      const result = await apiFetch<MessageResponse>(`${AUTH_ROUTES.resendPhone}?${query.toString()}`, {
+        method: "POST"
       });
+      const context: VerificationContext = {
+        registrationId: verificationContext?.registrationId,
+        email: verificationContext?.email ?? currentUser?.email ?? "",
+        phone: normalizedPhone,
+        emailVerified: verificationContext?.emailVerified ?? currentUser?.emailVerified ?? false,
+        phoneVerified: false
+      };
+      persistVerificationContext(context);
+      setVerificationContext(context);
       return { ok: true, message: result.message };
     } catch (error) {
       if (error instanceof ApiError) {
@@ -439,11 +534,11 @@ export const useMarketplaceStore = () => {
       }
       return { ok: false, message: "Khong the gui lai OTP luc nay." };
     }
-  }, [verificationContext?.phone, verificationContext?.registrationId]);
+  }, [currentUser?.email, currentUser?.emailVerified, currentUser?.phone, verificationContext?.email, verificationContext?.emailVerified, verificationContext?.phone, verificationContext?.registrationId]);
 
   const logout = useCallback(async () => {
     try {
-      await apiFetch<{ message: string }>("/api/v1/auth/logout", { method: "POST" });
+      await apiFetch<{ message: string }>(AUTH_ROUTES.logout, { method: "POST" });
     } catch {
       // Keep logout local even if the backend is offline.
     } finally {

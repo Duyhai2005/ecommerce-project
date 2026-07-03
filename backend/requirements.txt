@@ -5,6 +5,7 @@ alembic
 asyncmy
 pydantic-settings
 python-jose[cryptography]
+PyJWT
 argon2-cffi
 email-validator
 httpx

@@ -1011,7 +1011,7 @@ export function AppShell() {
       const result =
         type === "email"
           ? await store.resendEmailVerification()
-          : await store.resendPhoneVerification();
+          : await store.resendPhoneVerification(normalizeAuthPhoneInput(phone || store.verificationContext?.phone || store.currentUser?.phone || ""));
       showToast(result.message, result.ok ? "success" : "danger");
     };
 
